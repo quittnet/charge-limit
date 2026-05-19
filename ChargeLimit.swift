@@ -42,14 +42,10 @@ final class BattClient {
         }
     }
 
-    // Reads `batt status` and extracts the current limit (10-100).
-    // Note: batt reports limit=100 as "disabled" — but that's just a value, not a separate state.
-    // We treat it purely as a number; UI snooze state is tracked in the model.
     func readLimit() -> Int? {
         let result = run(["status"])
         for raw in result.output.split(separator: "\n") {
             let line = String(raw)
-            // Look for the "Charge limit:" line specifically
             if line.lowercased().contains("charge limit:") {
                 let scanner = Scanner(string: line)
                 scanner.charactersToBeSkipped = CharacterSet.decimalDigits.inverted
@@ -62,8 +58,6 @@ final class BattClient {
     }
 
     func setLimit(_ value: Int) {
-        // Run off the main thread — the Process call can take a few hundred ms
-        // and we don't want to block UI responsiveness during slider commits.
         DispatchQueue.global(qos: .userInitiated).async {
             _ = self.run(["limit", "\(value)"])
         }
@@ -76,9 +70,96 @@ final class BattClient {
     }
 }
 
+// MARK: - Low Power Mode (pmset wrapper)
+
+extension Notification.Name {
+    // Posted by the model when an LPM toggle needs first-time consent. The
+    // AppDelegate listens, closes the dropdown, and presents an explanatory
+    // alert before any admin dialog. userInfo: "enabled" Bool, "previous" Bool.
+    static let chargeLimitNeedsLPMConsent = Notification.Name("ChargeLimit.NeedsLPMConsent")
+}
+
+enum PowerManager {
+    static let sudoersPath = "/etc/sudoers.d/chargelimit-pmset"
+
+    // True when the sudoers entry we install ourselves is in place — we can
+    // toggle LPM with no prompt. `sudo -n -l <cmd>` is NOT reliable here: it
+    // returns success for any command the user could run after typing a
+    // password, not specifically for NOPASSWD entries. Checking for our file
+    // is the only definitive signal that we set up passwordless access.
+    static var hasPasswordlessAccess: Bool {
+        FileManager.default.fileExists(atPath: sudoersPath)
+    }
+
+    // Silent path. Only call when hasPasswordlessAccess is true.
+    static func setLowPowerModeSilently(_ enabled: Bool, completion: @escaping (Bool) -> Void) {
+        let value = enabled ? 1 : 0
+        DispatchQueue.global(qos: .userInitiated).async {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            task.arguments = ["-n", "/usr/bin/pmset", "-a", "lowpowermode", "\(value)"]
+            let null = Pipe()
+            task.standardOutput = null
+            task.standardError = null
+            var success = false
+            do {
+                try task.run()
+                task.waitUntilExit()
+                success = task.terminationStatus == 0
+            } catch {}
+            DispatchQueue.main.async { completion(success) }
+        }
+    }
+
+    // First-time setup: admin prompt installs a sudoers entry scoped to ONLY
+    // `pmset -a lowpowermode 0|1` for this user, AND toggles LPM in the same
+    // admin context (so just one auth dialog). MUST only be called after
+    // explicit in-app consent — never as the silent fallback of an LPM toggle.
+    static func installSudoersAndSet(enabled: Bool, completion: @escaping (Bool) -> Void) {
+        let value = enabled ? 1 : 0
+        let username = NSUserName()
+        // Sudoers files MUST end with a newline — visudo rejects entries that
+        // don't, which was silently failing the previous temp-file+visudo dance.
+        // We also write the file directly via `tee` (running as root) so there's
+        // no middle step that can fail without surfacing an error.
+        let entry = "\(username) ALL=(root) NOPASSWD: /usr/bin/pmset -a lowpowermode 0, /usr/bin/pmset -a lowpowermode 1\n"
+        // Inside an AppleScript double-quoted string we can't safely embed
+        // arbitrary single quotes either, so base64-encode the entry and decode
+        // it on the other side. Same trick the macOS docs recommend for
+        // `do shell script` payloads with funky characters.
+        let entryB64 = Data(entry.utf8).base64EncodedString()
+        let bash = "set -e; "
+            + "echo \(entryB64) | /usr/bin/base64 -D | /usr/bin/tee \(sudoersPath) > /dev/null; "
+            + "/bin/chmod 440 \(sudoersPath); "
+            + "/usr/sbin/chown root:wheel \(sudoersPath); "
+            + "/usr/sbin/visudo -cf \(sudoersPath) > /dev/null; "
+            + "/usr/bin/pmset -a lowpowermode \(value)"
+        let source = "do shell script \"\(bash)\" with administrator privileges"
+        DispatchQueue.global(qos: .userInitiated).async {
+            var success = false
+            if let appleScript = NSAppleScript(source: source) {
+                var error: NSDictionary?
+                appleScript.executeAndReturnError(&error)
+                if let error {
+                    NSLog("ChargeLimit: installSudoersAndSet AppleScript error: \(error)")
+                } else {
+                    success = true
+                }
+            }
+            // Verify the file actually landed — AppleScript can return success
+            // for partial failures in some cases.
+            let installed = FileManager.default.fileExists(atPath: sudoersPath)
+            if success && !installed {
+                NSLog("ChargeLimit: installSudoersAndSet returned success but file is missing at \(sudoersPath)")
+            }
+            DispatchQueue.main.async { completion(success && installed) }
+        }
+    }
+}
+
 // MARK: - Battery info (IOKit)
 
-struct BatteryInfo {
+struct BatteryInfo: Equatable {
     let percent: Int
     let isCharging: Bool
     let isPluggedIn: Bool
@@ -124,13 +205,19 @@ enum MenuBarIcon {
     private static let symbolPointSize: CGFloat = 20
 
     static func image(for info: BatteryInfo) -> NSImage? {
-        // Always render fill from real percentage via the variable-value symbol.
         let value = max(0.0, min(1.0, Double(info.percent) / 100.0))
-        var battery = NSImage(systemSymbolName: "battery.0to100",
+
+        // Plugged-in symbols include Apple's own bolt overlay as a third
+        // hierarchical layer — we color it explicitly so the bolt is always
+        // legible against the fill color (the old custom cutout drew a
+        // bolt-shaped hole which read as dark-on-green and was unreadable).
+        let baseName = info.isPluggedIn ? "battery.100percent.bolt" : "battery.0to100"
+        var battery = NSImage(systemSymbolName: baseName,
                               variableValue: value,
                               accessibilityDescription: "Battery: \(info.percent)%")
         if battery == nil {
-            // Discrete fallback if 0to100 unavailable on this system
+            // Older systems without the variable-value bolt symbol — pick the
+            // closest discrete step.
             let step: Int
             switch info.percent {
             case 0..<13:   step = 0
@@ -146,64 +233,45 @@ enum MenuBarIcon {
             battery = NSImage(systemSymbolName: "battery.100", accessibilityDescription: "Battery")
         }
 
-        // Color rules: red ≤20%, else yellow on LPM, else template (auto-tints)
+        // Apple's menu bar palette: outline stays muted, fill takes the state color.
+        //  - red ≤20%
+        //  - yellow on Low Power Mode
+        //  - green when actively charging
+        //  - neutral (label color) when held at the limit or on battery
+        let outlineColor: NSColor = .secondaryLabelColor
+        let fillColor: NSColor
         let useTemplate: Bool
-        let tint: NSColor?
         if info.percent <= 20 {
-            tint = .systemRed; useTemplate = false
+            fillColor = .systemRed;    useTemplate = false
         } else if info.isLowPowerMode {
-            tint = .systemYellow; useTemplate = false
+            fillColor = .systemYellow; useTemplate = false
+        } else if info.isCharging {
+            fillColor = .systemGreen;  useTemplate = false
         } else {
-            tint = nil; useTemplate = true
+            fillColor = .labelColor;   useTemplate = !info.isPluggedIn
         }
 
         let sizeConfig = NSImage.SymbolConfiguration(pointSize: symbolPointSize, weight: .regular)
         let finalConfig: NSImage.SymbolConfiguration
-        if let tint = tint {
-            finalConfig = sizeConfig.applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
-        } else {
+        if useTemplate {
             finalConfig = sizeConfig
+        } else {
+            // For the bolt symbol the third palette color paints the bolt itself.
+            // White reads on every colored fill (red/green/yellow); for the
+            // neutral plugged-in-not-charging case we use labelColor so the bolt
+            // matches the fill and adapts to dark/light mode.
+            let boltColor: NSColor = (fillColor == .labelColor) ? .labelColor : .white
+            let palette: [NSColor] = info.isPluggedIn
+                ? [outlineColor, fillColor, boltColor]
+                : [outlineColor, fillColor]
+            finalConfig = sizeConfig.applying(
+                NSImage.SymbolConfiguration(paletteColors: palette)
+            )
         }
         battery = battery?.withSymbolConfiguration(finalConfig)
 
-        // When plugged in (charging OR at limit), punch a bolt-shaped cutout
-        // through the fill — same visual as Apple's menu bar battery.
-        var result = battery
-        if info.isPluggedIn, let base = battery {
-            result = boltCutout(over: base)
-        }
-        result?.isTemplate = useTemplate
-        return result
-    }
-
-    private static func boltCutout(over battery: NSImage) -> NSImage {
-        // Smaller, lighter bolt so it sits cleanly inside the battery body — matches Apple's icon
-        let boltConfig = NSImage.SymbolConfiguration(pointSize: symbolPointSize * 0.45, weight: .medium)
-        guard let bolt = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: nil)?
-            .withSymbolConfiguration(boltConfig) else {
-            return battery
-        }
-
-        let size = battery.size
-        let out = NSImage(size: size)
-        out.lockFocus()
-
-        battery.draw(at: .zero,
-                     from: NSRect(origin: .zero, size: size),
-                     operation: .sourceOver,
-                     fraction: 1.0)
-
-        // Center the bolt in the battery body — slight left shift accounts for the cap on the right
-        let boltSize = bolt.size
-        let x = (size.width - boltSize.width) / 2 - size.width * 0.04
-        let y = (size.height - boltSize.height) / 2
-        bolt.draw(at: NSPoint(x: x, y: y),
-                  from: NSRect(origin: .zero, size: boltSize),
-                  operation: .destinationOut,
-                  fraction: 1.0)
-
-        out.unlockFocus()
-        return out
+        battery?.isTemplate = useTemplate
+        return battery
     }
 }
 
@@ -215,41 +283,123 @@ final class AppModel: ObservableObject {
     @Published var battInstalled: Bool = false
     @Published var daemonRunning: Bool = false
     @Published var battery: BatteryInfo? = nil
+    @Published var lowPowerMode: Bool = false
     @Published var lastError: String? = nil
 
     var isSnoozed: Bool { snoozedUntil != nil }
 
     private var midnightTimer: Timer?
     private var refreshTimer: Timer?
+    private var safetyTimer: Timer?
     private var aggressiveTimer: Timer?
+    private var iopsRunLoopSource: CFRunLoopSource?
+    private var optimisticUntil: Date?
     private var savedLimitForSnooze: Int = 80
     private let savedLimitKey = "ChargeLimit.savedLimit"
+    private let snoozeUntilKey = "ChargeLimit.snoozeUntil"
+    private let snoozeSavedLimitKey = "ChargeLimit.snoozeSavedLimit"
 
     init() {
         let saved = UserDefaults.standard.integer(forKey: savedLimitKey)
         if [80, 85, 90, 95, 100].contains(saved) {
             currentLimit = saved
         }
+        // Restore in-flight snooze across relaunches.
+        let savedSnoozeLimit = UserDefaults.standard.integer(forKey: snoozeSavedLimitKey)
+        if [80, 85, 90, 95, 100].contains(savedSnoozeLimit) {
+            savedLimitForSnooze = savedSnoozeLimit
+        }
+        if let until = UserDefaults.standard.object(forKey: snoozeUntilKey) as? Date {
+            if until > Date() {
+                snoozedUntil = until
+                scheduleMidnightTimer(fireAt: until)
+            } else {
+                BattClient.shared.setLimit(savedLimitForSnooze)
+                currentLimit = savedLimitForSnooze
+                UserDefaults.standard.removeObject(forKey: snoozeUntilKey)
+                UserDefaults.standard.removeObject(forKey: snoozeSavedLimitKey)
+            }
+        }
+        lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+        setupPowerObservers()
         refresh()
     }
 
+    private func setupPowerObservers() {
+        // IOPS callback — fires on plug/unplug AND charging start/stop. Without
+        // this the menu bar only updated on the 30s safety poll, so plug events
+        // could lag noticeably.
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let callback: IOPowerSourceCallbackType = { ctx in
+            guard let ctx = ctx else { return }
+            let me = Unmanaged<AppModel>.fromOpaque(ctx).takeUnretainedValue()
+            DispatchQueue.main.async { me.refreshBattery() }
+        }
+        if let source = IOPSNotificationCreateRunLoopSource(callback, context)?.takeRetainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+            iopsRunLoopSource = source
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: Notification.Name.NSProcessInfoPowerStateDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+            self.refreshBattery()
+        }
+
+        // IOPS notifications cover plug/unplug and charging start/stop, which are
+        // the events that change the icon's color/bolt. Percent drifts slowly,
+        // so a 5-minute safety poll is plenty to keep the icon honest without
+        // waking the process every 30s.
+        safetyTimer = Timer.scheduledTimer(withTimeInterval: 300.0, repeats: true) { [weak self] _ in
+            self?.refreshBattery()
+        }
+    }
+
+    // Reads IOKit, but during the post-limit-change window we hold the predicted
+    // state until the SMC catches up — otherwise the dropdown flashes "plugged in,
+    // not charging" for 2-3 seconds while the controller transitions.
+    func refreshBattery() {
+        let smc = BatteryInfo.current()
+        let now = Date()
+        if let until = optimisticUntil, now < until,
+           let s = smc, let cur = battery,
+           s.isCharging != cur.isCharging {
+            return
+        }
+        battery = smc
+        if let until = optimisticUntil, now >= until {
+            optimisticUntil = nil
+        }
+    }
+
     func refresh() {
+        // Fast, main-thread-only work: filesystem + IOKit reads.
         battInstalled = BattClient.shared.isInstalled
-        battery = BatteryInfo.current()
+        refreshBattery()
         guard battInstalled else { daemonRunning = false; return }
-        daemonRunning = BattClient.shared.isDaemonRunning
-        guard daemonRunning else { return }
-        // Sync slider with batt's actual limit, but only when we're not in a user snooze
-        // (otherwise the live state of 100% would clobber the saved preference).
-        if !isSnoozed, let l = BattClient.shared.readLimit(), [80, 85, 90, 95, 100].contains(l) {
-            currentLimit = l
+        // Shelling out to `batt` blocks for a few hundred ms — keep it off the
+        // main thread so opening the popup doesn't hitch.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let running = BattClient.shared.isDaemonRunning
+            let liveLimit: Int? = running ? BattClient.shared.readLimit() : nil
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.daemonRunning = running
+                if !self.isSnoozed, let l = liveLimit, [80, 85, 90, 95, 100].contains(l) {
+                    self.currentLimit = l
+                }
+            }
         }
     }
 
     func startLiveRefresh() {
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.battery = BatteryInfo.current()
+            self?.refreshBattery()
         }
     }
 
@@ -258,15 +408,13 @@ final class AppModel: ObservableObject {
         refreshTimer = nil
     }
 
-    // After a limit change the SMC takes a couple seconds to start/stop charging.
-    // Poll quickly for a short window so the UI reflects the transition immediately.
-    private func pulseFastRefresh(seconds: Double = 6.0) {
+    private func pulseFastRefresh(seconds: Double = 5.0) {
         aggressiveTimer?.invalidate()
-        let interval = 0.1
+        let interval = 0.15
         var ticksRemaining = Int(seconds / interval)
         aggressiveTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
-            self.battery = BatteryInfo.current()
+            self.refreshBattery()
             ticksRemaining -= 1
             if ticksRemaining <= 0 {
                 timer.invalidate()
@@ -275,33 +423,40 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func setOptimistic(isCharging: Bool) {
+        guard let cur = battery, cur.isPluggedIn else { return }
+        battery = BatteryInfo(
+            percent: cur.percent,
+            isCharging: isCharging,
+            isPluggedIn: cur.isPluggedIn,
+            isLowPowerMode: cur.isLowPowerMode
+        )
+        optimisticUntil = Date().addingTimeInterval(4.0)
+    }
+
     func selectLimit(_ value: Int) {
         guard battInstalled, daemonRunning else { return }
         currentLimit = value
         UserDefaults.standard.set(value, forKey: savedLimitKey)
         BattClient.shared.setLimit(value)
-        // Optimistic UI: predict new charging state immediately so the popup
-        // reflects the change before the SMC actually transitions.
         if let cur = battery, cur.isPluggedIn {
-            let willCharge = value > cur.percent
-            battery = BatteryInfo(
-                percent: cur.percent,
-                isCharging: willCharge,
-                isPluggedIn: cur.isPluggedIn,
-                isLowPowerMode: cur.isLowPowerMode
-            )
+            setOptimistic(isCharging: value > cur.percent)
         }
-        // Any explicit slider change cancels an in-progress snooze
         midnightTimer?.invalidate()
         midnightTimer = nil
         snoozedUntil = nil
+        UserDefaults.standard.removeObject(forKey: snoozeUntilKey)
+        UserDefaults.standard.removeObject(forKey: snoozeSavedLimitKey)
         pulseFastRefresh()
     }
 
     func disableForToday() {
         guard battInstalled, daemonRunning else { return }
-        savedLimitForSnooze = currentLimit
-        BattClient.shared.setLimit(100)   // batt treats 100 as disabled
+        if !isSnoozed { savedLimitForSnooze = currentLimit }
+        BattClient.shared.setLimit(100)
+        if let cur = battery, cur.isPluggedIn {
+            setOptimistic(isCharging: cur.percent < 100)
+        }
         pulseFastRefresh()
 
         let calendar = Calendar.current
@@ -313,20 +468,9 @@ final class AppModel: ObservableObject {
         ) ?? now.addingTimeInterval(86400)
         snoozedUntil = nextMidnight
 
-        let savedLimit = savedLimitForSnooze
-        midnightTimer?.invalidate()
-        midnightTimer = Timer.scheduledTimer(
-            withTimeInterval: nextMidnight.timeIntervalSince(now),
-            repeats: false
-        ) { [weak self] _ in
-            guard let self else { return }
-            BattClient.shared.setLimit(savedLimit)
-            DispatchQueue.main.async {
-                self.currentLimit = savedLimit
-                self.snoozedUntil = nil
-                self.refresh()
-            }
-        }
+        UserDefaults.standard.set(nextMidnight, forKey: snoozeUntilKey)
+        UserDefaults.standard.set(savedLimitForSnooze, forKey: snoozeSavedLimitKey)
+        scheduleMidnightTimer(fireAt: nextMidnight)
     }
 
     func resumeNow() {
@@ -336,7 +480,76 @@ final class AppModel: ObservableObject {
         BattClient.shared.setLimit(savedLimitForSnooze)
         currentLimit = savedLimitForSnooze
         snoozedUntil = nil
+        UserDefaults.standard.removeObject(forKey: snoozeUntilKey)
+        UserDefaults.standard.removeObject(forKey: snoozeSavedLimitKey)
+        if let cur = battery, cur.isPluggedIn {
+            setOptimistic(isCharging: savedLimitForSnooze > cur.percent)
+        }
         pulseFastRefresh()
+    }
+
+    private func scheduleMidnightTimer(fireAt date: Date) {
+        midnightTimer?.invalidate()
+        let savedLimit = savedLimitForSnooze
+        midnightTimer = Timer.scheduledTimer(
+            withTimeInterval: max(1, date.timeIntervalSinceNow),
+            repeats: false
+        ) { [weak self] _ in
+            guard let self else { return }
+            BattClient.shared.setLimit(savedLimit)
+            DispatchQueue.main.async {
+                self.currentLimit = savedLimit
+                self.snoozedUntil = nil
+                UserDefaults.standard.removeObject(forKey: self.snoozeUntilKey)
+                UserDefaults.standard.removeObject(forKey: self.snoozeSavedLimitKey)
+                self.refresh()
+            }
+        }
+    }
+
+    func setLowPowerMode(_ enabled: Bool) {
+        let previous = lowPowerMode
+        lowPowerMode = enabled  // optimistic — reconciled below or via system notification
+
+        if PowerManager.hasPasswordlessAccess {
+            PowerManager.setLowPowerModeSilently(enabled) { [weak self] success in
+                guard let self else { return }
+                if success {
+                    self.lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+                } else {
+                    // Sudoers file is present but sudo refused — most likely the
+                    // file was edited or removed externally. Roll back the
+                    // optimistic UI and fall through to the consent path so the
+                    // user can re-grant or cancel.
+                    self.lowPowerMode = previous
+                    NotificationCenter.default.post(
+                        name: .chargeLimitNeedsLPMConsent,
+                        object: nil,
+                        userInfo: ["enabled": enabled, "previous": previous]
+                    )
+                }
+            }
+        } else {
+            // Defer to the AppDelegate to show the consent alert. Keeps UI
+            // concerns out of the model, and lets the delegate close the
+            // dropdown first (NSAlert won't show above a popUpMenu window).
+            NotificationCenter.default.post(
+                name: .chargeLimitNeedsLPMConsent,
+                object: nil,
+                userInfo: ["enabled": enabled, "previous": previous]
+            )
+        }
+    }
+
+    func confirmFirstTimeLPM(enable: Bool) {
+        PowerManager.installSudoersAndSet(enabled: enable) { [weak self] _ in
+            guard let self else { return }
+            self.lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+        }
+    }
+
+    func cancelFirstTimeLPM(previous: Bool) {
+        lowPowerMode = previous
     }
 }
 
@@ -358,6 +571,7 @@ struct ChargeLimitView: View {
                 sliderRow
                 batteryRow
                 Divider().opacity(0.35)
+                lowPowerRow
                 bottomRow
                 settingsLink
             }
@@ -365,7 +579,6 @@ struct ChargeLimitView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .frame(width: 260)
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .onAppear {
             sliderValue = Double(model.currentLimit)
             model.startLiveRefresh()
@@ -426,6 +639,21 @@ struct ChargeLimitView: View {
         }
     }
 
+    private var lowPowerRow: some View {
+        HStack(spacing: 8) {
+            Text("Low Power Mode")
+                .font(.system(size: 13))
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { model.lowPowerMode },
+                set: { model.setLowPowerMode($0) }
+            ))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+        }
+    }
+
     private var bottomRow: some View {
         HStack(spacing: 8) {
             Text("Turn off for today")
@@ -440,6 +668,7 @@ struct ChargeLimitView: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .controlSize(.small)
+            .help("Disables the charge limit until midnight, then automatically restores your saved value.")
         }
     }
 
@@ -449,7 +678,7 @@ struct ChargeLimitView: View {
             onDismiss()
         } label: {
             HStack(spacing: 4) {
-                Text("Battery Settings…")
+                Text("Battery Settings")
                     .font(.system(size: 13))
                 Spacer()
             }
@@ -460,7 +689,6 @@ struct ChargeLimitView: View {
     }
 
     private func openBatterySettings() {
-        // Tahoe / Ventura+ pane identifier; falls back to legacy URL on older systems.
         let candidates = [
             "x-apple.systempreferences:com.apple.Battery-Settings.extension",
             "x-apple.systempreferences:com.apple.preference.battery",
@@ -537,60 +765,131 @@ struct ChargeLimitView: View {
     }
 }
 
+// MARK: - Rounded mask image for the visual effect view
+//
+// Apple's documented recipe for a rounded NSVisualEffectView: build a 9-slice
+// stretchable NSImage of a filled rounded rect and assign it to `maskImage`.
+// Unlike CAShapeLayer/CALayer masks, this is what the window-server uses to
+// compute `hasShadow`, so the drop shadow follows the rounded corners exactly
+// instead of rendering as a rectangle behind the popup.
+private func roundedMaskImage(cornerRadius: CGFloat) -> NSImage {
+    let edge: CGFloat = cornerRadius * 2 + 1
+    let image = NSImage(size: NSSize(width: edge, height: edge), flipped: false) { rect in
+        let path = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
+        NSColor.black.setFill()
+        path.fill()
+        return true
+    }
+    image.capInsets = NSEdgeInsets(top: cornerRadius, left: cornerRadius,
+                                   bottom: cornerRadius, right: cornerRadius)
+    image.resizingMode = .stretch
+    return image
+}
+
 // MARK: - App delegate (status item + dropdown window)
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var window: NSWindow?
     private var eventMonitor: Any?
+    private var localKeyMonitor: Any?
     private let model = AppModel()
-    private var iconRefreshTimer: Timer?
-    private var iopsRunLoopSource: CFRunLoopSource?
+    private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        statusItem = NSStatusBar.system.statusItem(withLength: 36)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             btn.imagePosition = .imageOnly
             btn.target = self
-            btn.action = #selector(togglePopup(_:))
+            btn.action = #selector(statusItemClicked(_:))
+            btn.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
         refreshMenuBarIcon()
 
-        // React to Low Power Mode changes immediately
+        // The model owns power-state observation; the icon just reacts to changes.
+        model.$battery
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshMenuBarIcon() }
+            .store(in: &cancellables)
+
+        model.$lowPowerMode
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshMenuBarIcon() }
+            .store(in: &cancellables)
+
+        // Tooltip includes the configured limit and snooze state, so refresh
+        // when either changes.
+        model.$currentLimit
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshMenuBarIcon() }
+            .store(in: &cancellables)
+
+        model.$snoozedUntil
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshMenuBarIcon() }
+            .store(in: &cancellables)
+
         NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(refreshMenuBarIcon),
-            name: Notification.Name.NSProcessInfoPowerStateDidChange,
-            object: nil
-        )
-
-        // React to power source changes (plug/unplug, charging start/stop)
-        let context = Unmanaged.passUnretained(self).toOpaque()
-        let callback: IOPowerSourceCallbackType = { ctx in
-            guard let ctx = ctx else { return }
-            let me = Unmanaged<AppDelegate>.fromOpaque(ctx).takeUnretainedValue()
-            DispatchQueue.main.async { me.refreshMenuBarIcon() }
+            forName: .chargeLimitNeedsLPMConsent,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let enabled = (note.userInfo?["enabled"] as? Bool) ?? false
+            let previous = (note.userInfo?["previous"] as? Bool) ?? false
+            self.askForLPMConsent(enable: enabled, previous: previous)
         }
-        if let source = IOPSNotificationCreateRunLoopSource(callback, context)?.takeRetainedValue() {
-            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
-            iopsRunLoopSource = source
-        }
+    }
 
-        // Safety-net poll for battery-level changes (events above cover most cases)
-        iconRefreshTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
-            self?.refreshMenuBarIcon()
+    private func askForLPMConsent(enable: Bool, previous: Bool) {
+        closePopup()
+
+        let alert = NSAlert()
+        alert.messageText = "Allow Low Power Mode without prompting?"
+        alert.informativeText = """
+        macOS requires administrator privileges to change Low Power Mode. To avoid prompting on every toggle, ChargeLimit can install a one-time permission rule that lets only these two exact commands run without a password:
+
+            sudo pmset -a lowpowermode 0
+            sudo pmset -a lowpowermode 1
+
+        The rule lives at \(PowerManager.sudoersPath) and is scoped to your user account. To remove it later, run:
+
+            sudo rm \(PowerManager.sudoersPath)
+
+        Continuing will show the macOS admin authentication dialog once. After that, the LPM toggle works silently.
+        """
+        alert.addButton(withTitle: "Continue…")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .informational
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            model.confirmFirstTimeLPM(enable: enable)
+        } else {
+            model.cancelFirstTimeLPM(previous: previous)
         }
     }
 
     @objc private func refreshMenuBarIcon() {
         guard let btn = statusItem?.button else { return }
-        let info = BatteryInfo.current()
-        model.battery = info
-        if let info {
-            btn.toolTip = "\(info.percent)% — \(info.statusLabel)"
+        if let info = model.battery {
+            let limitText: String
+            if let until = model.snoozedUntil {
+                let formatter = DateFormatter()
+                formatter.dateFormat = "HH:mm"
+                limitText = "Limit off until \(formatter.string(from: until))"
+            } else {
+                limitText = "Limit \(model.currentLimit)%"
+            }
+            btn.toolTip = "\(info.percent)% — \(info.statusLabel) · \(limitText)"
             if let img = MenuBarIcon.image(for: info) {
                 btn.image = img
             }
@@ -602,6 +901,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func statusItemClicked(_ sender: Any?) {
+        let event = NSApp.currentEvent
+        let isRight = event?.type == .rightMouseUp
+            || (event?.type == .leftMouseUp && event?.modifierFlags.contains(.control) == true)
+        if isRight {
+            showContextMenu()
+            return
+        }
+        togglePopup(sender)
+    }
+
     @objc private func togglePopup(_ sender: Any?) {
         if let w = window, w.isVisible {
             closePopup()
@@ -610,18 +920,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showPopup()
     }
 
+    private func showContextMenu() {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Open ChargeLimit", action: #selector(togglePopup(_:)), keyEquivalent: ""))
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit ChargeLimit", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
+    }
+
     private func showPopup() {
         model.refresh()
 
-        let cornerRadius: CGFloat = 18
+        let cornerRadius: CGFloat = 12
 
         let host = NSHostingView(rootView: ChargeLimitView(model: model, onDismiss: { [weak self] in
             self?.closePopup()
         }))
-        host.wantsLayer = true
-        host.layer?.cornerRadius = cornerRadius
-        host.layer?.cornerCurve = .continuous
-        host.layer?.masksToBounds = true
         host.needsLayout = true
         host.layoutSubtreeIfNeeded()
         let size = host.fittingSize
@@ -632,34 +954,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        win.contentView = host
         win.backgroundColor = .clear
         win.isOpaque = false
         win.hasShadow = true
-        win.level = .statusBar
+        // .popUpMenu matches the system menu-bar dropdown level — `.statusBar`
+        // sits above ordinary modals, which makes the popup feel intrusive.
+        win.level = .popUpMenu
         win.isMovable = false
+        win.hidesOnDeactivate = false
 
-        // Add visual material under the SwiftUI content
         let visual = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
         visual.material = .menu
         visual.blendingMode = .behindWindow
         visual.state = .active
-        visual.wantsLayer = true
-        visual.layer?.cornerRadius = cornerRadius
-        visual.layer?.cornerCurve = .continuous
-        visual.layer?.masksToBounds = true
         visual.autoresizingMask = [.width, .height]
-
-        // Explicit CAShapeLayer mask — corner-radius alone sometimes lets the
-        // vibrancy effect bleed past the rounded edge on Tahoe.
-        let maskLayer = CAShapeLayer()
-        maskLayer.path = CGPath(roundedRect: visual.bounds,
-                                cornerWidth: cornerRadius,
-                                cornerHeight: cornerRadius,
-                                transform: nil)
-        visual.layer?.mask = maskLayer
+        // Use Apple's documented rounded-popover recipe: a 9-slice mask image.
+        // This is what makes `win.hasShadow` produce a rounded shadow — layer
+        // masks (CAShapeLayer / CALayer) clip the visible pixels but the
+        // window-server's shadow path doesn't honor them, so the shadow comes
+        // out as a hard rectangle. `maskImage` fixes both at once.
+        visual.maskImage = roundedMaskImage(cornerRadius: cornerRadius)
 
         host.frame = visual.bounds
+        host.autoresizingMask = [.width, .height]
         visual.addSubview(host)
         win.contentView = visual
 
@@ -673,22 +990,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let y = btnOnScreen.minY - size.height - 4
         win.setFrameOrigin(NSPoint(x: x, y: y))
         win.makeKeyAndOrderFront(nil)
-        // Recompute the window shadow from the rounded content's alpha — without this,
-        // the shadow is a hard rectangle that shows behind the rounded corners.
         win.invalidateShadow()
         window = win
 
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             self?.closePopup()
         }
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.keyCode == 53 { // Escape
+                self?.closePopup()
+                return nil
+            }
+            return event
+        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleWindowResignKey(_:)),
+            name: NSWindow.didResignKeyNotification,
+            object: win
+        )
+    }
+
+    @objc private func handleWindowResignKey(_ note: Notification) {
+        closePopup()
     }
 
     private func closePopup() {
+        if let w = window {
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: w)
+        }
         window?.orderOut(nil)
         window = nil
         if let m = eventMonitor {
             NSEvent.removeMonitor(m)
             eventMonitor = nil
+        }
+        if let m = localKeyMonitor {
+            NSEvent.removeMonitor(m)
+            localKeyMonitor = nil
         }
     }
 }
