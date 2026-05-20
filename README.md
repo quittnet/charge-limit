@@ -65,6 +65,5 @@ swiftc ChargeLimit.swift -o ChargeLimit -framework AppKit -framework SwiftUI
 ./ChargeLimit
 ```
 
-## License
 
-MIT
+
