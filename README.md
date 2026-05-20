@@ -7,8 +7,8 @@ Click the power-plug icon in the menu bar to get a Control Center-style dropdown
 ![screenshot placeholder](docs/screenshot.png)
 
 ## Why
+While macOS allows you to set a charge limit, you must access the settings to do so. This app provides a clean and convenient menu bar toggle for this purpose. 
 
-macOS has no public API to set an arbitrary battery charge limit. The built-in 80% toggle on Apple Silicon (System Settings → Battery) is binary — you can't pick 85 or 90. This app gives you a 5-step slider with the same native feel as Apple's Control Center.
 
 ## How it works
 
