@@ -4,7 +4,7 @@ A small native macOS menu bar app for setting a battery charge limit on Apple Si
 
 Click the power-plug icon in the menu bar to get a Control Center-style dropdown with a slider that snaps to **80%, 85%, 90%, 95%, or 100%**, your current battery percentage and charging status, and a "Turn off for today" switch that disables the limit until midnight (it auto-re-applies your saved value at 00:00).
 
-![screenshot placeholder](docs/screenshot.png)
+
 
 ## Why
 While macOS allows you to set a charge limit, you must access the settings to do so. This app provides a clean and convenient menu bar toggle for this purpose. 
