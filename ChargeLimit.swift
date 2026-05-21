@@ -760,7 +760,7 @@ struct ChargeLimitView: View {
 
     private var powerConsumersSection: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Apps using significant energy")
+            Text(model.topConsumers.count == 1 ? "App using significant energy" : "Apps using significant energy")
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
             ForEach(model.topConsumers) { consumer in
