@@ -926,6 +926,8 @@ private func roundedMaskImage(cornerRadius: CGFloat) -> NSImage {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var window: NSWindow?
+    private var popupHost: NSView?
+    private var popupCancellable: AnyCancellable?
     private var eventMonitor: Any?
     private var localKeyMonitor: Any?
     private let model = AppModel()
@@ -1115,18 +1117,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         visual.addSubview(host)
         win.contentView = visual
 
-        guard let btn = statusItem.button,
-              let btnWindow = btn.window,
-              let screen = btnWindow.screen else { return }
-        let btnInWindow = btn.convert(btn.bounds, to: nil)
-        let btnOnScreen = btnWindow.convertToScreen(btnInWindow)
-        let screenMaxX = screen.visibleFrame.maxX
-        let x = max(4, min(btnOnScreen.midX - size.width / 2, screenMaxX - size.width - 4))
-        let y = btnOnScreen.minY - size.height - 4
-        win.setFrameOrigin(NSPoint(x: x, y: y))
+        positionPopup(window: win, size: size)
         win.makeKeyAndOrderFront(nil)
         win.invalidateShadow()
         window = win
+        popupHost = host
+
+        // The dropdown can grow mid-life — e.g. when the power-consumers
+        // section appears 1-2s after open. Without this the window origin
+        // stays put while SwiftUI grows the content, so the top edge ends up
+        // pushed above the menu bar. Re-measure + reposition on every change.
+        popupCancellable = model.$topConsumers
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.repositionPopupForCurrentContent() }
 
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             self?.closePopup()
@@ -1156,6 +1160,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         window?.orderOut(nil)
         window = nil
+        popupHost = nil
+        popupCancellable?.cancel()
+        popupCancellable = nil
         if let m = eventMonitor {
             NSEvent.removeMonitor(m)
             eventMonitor = nil
@@ -1164,6 +1171,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSEvent.removeMonitor(m)
             localKeyMonitor = nil
         }
+    }
+
+    private func positionPopup(window: NSWindow, size: NSSize) {
+        guard let btn = statusItem.button,
+              let btnWindow = btn.window,
+              let screen = btnWindow.screen else { return }
+        let btnInWindow = btn.convert(btn.bounds, to: nil)
+        let btnOnScreen = btnWindow.convertToScreen(btnInWindow)
+        let screenMaxX = screen.visibleFrame.maxX
+        let x = max(4, min(btnOnScreen.midX - size.width / 2, screenMaxX - size.width - 4))
+        let y = btnOnScreen.minY - size.height - 4
+        window.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+    }
+
+    private func repositionPopupForCurrentContent() {
+        guard let win = window, let host = popupHost else { return }
+        host.layoutSubtreeIfNeeded()
+        let newSize = host.fittingSize
+        guard newSize.width > 0, newSize.height > 0,
+              newSize != win.frame.size else { return }
+        positionPopup(window: win, size: newSize)
+        win.invalidateShadow()
     }
 }
 
