@@ -70,6 +70,104 @@ final class BattClient {
     }
 }
 
+// MARK: - Power consumer monitor (`top` wrapper)
+
+struct PowerConsumer: Identifiable, Hashable {
+    let id: Int   // pid
+    let name: String
+    let power: Double
+}
+
+enum PowerMonitor {
+    // Reads `top -l 2 -s 1 -n 30 -stats pid,command,power -o power`. The first
+    // sample reports cumulative power since each process started (huge numbers);
+    // the second sample reports the delta over the 1-second interval, which is
+    // what Activity Monitor's "Energy Impact" column shows. After parsing the
+    // sorted table, we intersect against NSWorkspace's list of regular apps so
+    // daemons (WindowServer, coreaudiod) and menu bar utilities (ChargeLimit
+    // itself, CPUAlert, etc.) drop out — Apple's "significant energy" list in
+    // the system battery menu does the same thing.
+    static func topConsumers(
+        minPower: Double = 20,
+        maxCount: Int = 3,
+        completion: @escaping ([PowerConsumer]) -> Void
+    ) {
+        DispatchQueue.global(qos: .utility).async {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/top")
+            task.arguments = ["-l", "2", "-s", "1", "-n", "30", "-stats", "pid,command,power", "-o", "power"]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = Pipe()
+            do {
+                try task.run()
+                task.waitUntilExit()
+            } catch {
+                DispatchQueue.main.async { completion([]) }
+                return
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            let raw = parse(output, minPower: minPower, maxCount: 30)
+            DispatchQueue.main.async {
+                let regularApps = NSWorkspace.shared.runningApplications.filter {
+                    $0.activationPolicy == .regular
+                }
+                let pidToName: [Int: String] = Dictionary(
+                    regularApps.compactMap { app -> (Int, String)? in
+                        guard let name = app.localizedName else { return nil }
+                        return (Int(app.processIdentifier), name)
+                    },
+                    uniquingKeysWith: { first, _ in first }
+                )
+                let filtered = raw.compactMap { c -> PowerConsumer? in
+                    guard let name = pidToName[c.id] else { return nil }
+                    return PowerConsumer(id: c.id, name: name, power: c.power)
+                }
+                completion(Array(filtered.prefix(maxCount)))
+            }
+        }
+    }
+
+    static func parse(_ output: String, minPower: Double, maxCount: Int) -> [PowerConsumer] {
+        // Split on the "Processes:" header that top emits at the top of each
+        // sample. Two samples → three components (pre-amble, sample1, sample2).
+        // We want the LAST sample.
+        let sections = output.components(separatedBy: "Processes:")
+        guard let secondSample = sections.last, sections.count >= 3 else { return [] }
+
+        var found: [PowerConsumer] = []
+        var inTable = false
+        for raw in secondSample.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw)
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !inTable {
+                let upper = trimmed.uppercased()
+                if upper.hasPrefix("PID") && upper.contains("POWER") {
+                    inTable = true
+                }
+                continue
+            }
+            if trimmed.isEmpty { continue }
+            // Format: "12345  Some App Name           45.3"
+            // PID is the first whitespace-separated token, POWER is the last,
+            // and everything between is the command (which may contain spaces).
+            let fields = trimmed.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count >= 3,
+                  let pid = Int(fields.first!),
+                  let power = Double(fields.last!) else {
+                continue
+            }
+            if power < minPower { break }   // sorted desc; nothing below will qualify
+            let name = fields.dropFirst().dropLast().joined(separator: " ")
+            guard !name.isEmpty else { continue }
+            found.append(PowerConsumer(id: pid, name: name, power: power))
+            if found.count >= maxCount { break }
+        }
+        return found
+    }
+}
+
 // MARK: - Low Power Mode (pmset wrapper)
 
 extension Notification.Name {
@@ -284,6 +382,7 @@ final class AppModel: ObservableObject {
     @Published var daemonRunning: Bool = false
     @Published var battery: BatteryInfo? = nil
     @Published var lowPowerMode: Bool = false
+    @Published var topConsumers: [PowerConsumer] = []
     @Published var lastError: String? = nil
 
     var isSnoozed: Bool { snoozedUntil != nil }
@@ -292,6 +391,7 @@ final class AppModel: ObservableObject {
     private var refreshTimer: Timer?
     private var safetyTimer: Timer?
     private var aggressiveTimer: Timer?
+    private var powerConsumersTimer: Timer?
     private var iopsRunLoopSource: CFRunLoopSource?
     private var optimisticUntil: Date?
     private var savedLimitForSnooze: Int = 80
@@ -401,11 +501,26 @@ final class AppModel: ObservableObject {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refreshBattery()
         }
+        // `top` takes ~1s per sample window, so poll on a separate, slower timer.
+        // Refresh once immediately so the section can appear on first open.
+        refreshTopConsumers()
+        powerConsumersTimer?.invalidate()
+        powerConsumersTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
+            self?.refreshTopConsumers()
+        }
     }
 
     func stopLiveRefresh() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        powerConsumersTimer?.invalidate()
+        powerConsumersTimer = nil
+    }
+
+    private func refreshTopConsumers() {
+        PowerMonitor.topConsumers { [weak self] consumers in
+            self?.topConsumers = consumers
+        }
     }
 
     private func pulseFastRefresh(seconds: Double = 5.0) {
@@ -570,6 +685,10 @@ struct ChargeLimitView: View {
             } else {
                 sliderRow
                 batteryRow
+                if !model.topConsumers.isEmpty {
+                    Divider().opacity(0.35)
+                    powerConsumersSection
+                }
                 Divider().opacity(0.35)
                 lowPowerRow
                 bottomRow
@@ -635,6 +754,22 @@ struct ChargeLimitView: View {
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
                 Spacer()
+            }
+        }
+    }
+
+    private var powerConsumersSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Apps using significant energy")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+            ForEach(model.topConsumers) { consumer in
+                Text(consumer.name)
+                    .font(.system(size: 12))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
