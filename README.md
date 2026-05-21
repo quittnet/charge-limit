@@ -2,13 +2,12 @@
 
 A small native macOS menu bar app for setting a battery charge limit on Apple Silicon Macs.
 
-Click the power-plug icon in the menu bar to get a Control Center-style dropdown with a slider that snaps to **80%, 85%, 90%, 95%, or 100%**, your current battery percentage and charging status, and a "Turn off for today" switch that disables the limit until midnight (it auto-re-applies your saved value at 00:00).
+Click the power-plug icon in the menu bar to get a Control Center-style dropdown with a slider that snaps to **80%, 85%, 90%, 95%, or 100%**, your current battery percentage and charging status, Low Power Mode, and a "Turn off for today" switch that disables the limit until midnight (it auto-re-applies your saved value at 00:00).
 
-
+![ChargeLimit menu bar dropdown — Charge Limit slider at 80%, battery status, Low Power Mode and Turn off for today toggles, Battery Settings shortcut](docs/screenshot.png)
 
 ## Why
 While macOS allows you to set a charge limit, you must access the settings to do so. This app provides a clean and convenient menu bar toggle for this purpose. 
-
 
 ## How it works
 
@@ -48,7 +47,9 @@ To stop:
 
 - **Charge Limit** label + slider (80–100 in 5% steps) + current value
 - Battery icon, current battery percentage, and charging status ("Charging" / "Plugged in, not charging" / "On battery"), refreshing every 2 seconds while the popup is open
+- **Low Power Mode** toggle — wraps `pmset -a lowpowermode 0/1`. The first time you flip it, ChargeLimit offers to install a `/etc/sudoers.d` rule that whitelists exactly those two commands so the toggle doesn't prompt for a password on every flip
 - A native switch for **Turn off for today** — flips it on to disable the limit; it auto-re-applies your saved value at the next midnight, or you can flip the switch back off to resume immediately
+- **Battery Settings** — opens System Settings → Battery
 
 ## Files
 
